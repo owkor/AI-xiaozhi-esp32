@@ -1,23 +1,19 @@
 #include "wifi_board.h"
-#include "es8388_audio_codec.h"
+#include "codecs/es8388_audio_codec.h"
 #include "display/lcd_display.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
 #include "i2c_device.h"
-#include "iot/thing_manager.h"
 #include "led/single_led.h"
+#include "esp32_camera.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
-#include <wifi_station.h>
 
 #define TAG "atk_dnesp32s3"
-
-LV_FONT_DECLARE(font_puhui_20_4);
-LV_FONT_DECLARE(font_awesome_20_4);
 
 class XL9555 : public I2cDevice {
 public:
@@ -28,14 +24,16 @@ public:
 
     void SetOutputState(uint8_t bit, uint8_t level) {
         uint16_t data;
+        int index = bit;
+
         if (bit < 8) {
             data = ReadReg(0x02);
         } else {
             data = ReadReg(0x03);
-            bit -= 8;
+            index -= 8;
         }
 
-        data = (data & ~(1 << bit)) | (level << bit);
+        data = (data & ~(1 << index)) | (level << index);
 
         if (bit < 8) {
             WriteReg(0x02, data);
@@ -45,13 +43,13 @@ public:
     }
 };
 
-
 class atk_dnesp32s3 : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     Button boot_button_;
     LcdDisplay* display_;
     XL9555* xl9555_;
+    Esp32Camera* camera_;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -88,8 +86,9 @@ private:
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ResetWifiConfiguration();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                EnterWifiConfigMode();
+                return;
             }
             app.ToggleChatState();
         });
@@ -128,23 +127,59 @@ private:
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY); 
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         display_ = new SpiLcdDisplay(panel_io, panel,
-                                    DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
-                                    {
-                                        .text_font = &font_puhui_20_4,
-                                        .icon_font = &font_awesome_20_4,
-                                        #if CONFIG_USE_WECHAT_MESSAGE_STYLE
-                                            .emoji_font = font_emoji_32_init(),
-                                        #else
-                                            .emoji_font = DISPLAY_HEIGHT >= 240 ? font_emoji_64_init() : font_emoji_32_init(),
-                                        #endif
-                                    });
+                                    DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
-    // 物联网初始化，添加对 AI 可见设备 
-    void InitializeIot() {
-        auto& thing_manager = iot::ThingManager::GetInstance();
-        thing_manager.AddThing(iot::CreateThing("Speaker"));
-        thing_manager.AddThing(iot::CreateThing("Screen"));
+    // 初始化摄像头：ov2640；
+    // 根据正点原子官方示例参数
+    void InitializeCamera() {
+        xl9555_->SetOutputState(OV_PWDN_IO, 0); // PWDN=低 (上电)
+        xl9555_->SetOutputState(OV_RESET_IO, 0); // 确保复位
+        vTaskDelay(pdMS_TO_TICKS(50));           // 延长复位保持时间
+        xl9555_->SetOutputState(OV_RESET_IO, 1); // 释放复位
+        vTaskDelay(pdMS_TO_TICKS(50));           // 延长 50ms
+
+        static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
+            .data_width = CAM_CTLR_DATA_WIDTH_8,
+            .data_io = {
+                [0] = CAM_PIN_D0,
+                [1] = CAM_PIN_D1,
+                [2] = CAM_PIN_D2,
+                [3] = CAM_PIN_D3,
+                [4] = CAM_PIN_D4,
+                [5] = CAM_PIN_D5,
+                [6] = CAM_PIN_D6,
+                [7] = CAM_PIN_D7,
+            },
+            .vsync_io = CAM_PIN_VSYNC,
+            .de_io = CAM_PIN_HREF,
+            .pclk_io = CAM_PIN_PCLK,
+            .xclk_io = CAM_PIN_XCLK,
+        };
+
+        esp_video_init_sccb_config_t sccb_config = {
+            .init_sccb = true,
+            .i2c_config = {
+                .port = 1,
+                .scl_pin = CAM_PIN_SIOC,
+                .sda_pin = CAM_PIN_SIOD,
+            },
+            .freq = 100000,
+        };
+
+        esp_video_init_dvp_config_t dvp_config = {
+            .sccb_config = sccb_config,
+            .reset_pin = CAM_PIN_RESET,   // 实际由 XL9555 控制
+            .pwdn_pin = CAM_PIN_PWDN,     // 实际由 XL9555 控制
+            .dvp_pin = dvp_pin_config,
+            .xclk_freq = 20000000,
+        };
+
+        esp_video_init_config_t video_config = {
+            .dvp = &dvp_config,
+        };
+
+        camera_ = new Esp32Camera(video_config);
     }
 
 public:
@@ -153,7 +188,7 @@ public:
         InitializeSpi();
         InitializeSt7789Display();
         InitializeButtons();
-        InitializeIot();
+        InitializeCamera();
     }
 
     virtual Led* GetLed() override {
@@ -180,6 +215,10 @@ public:
 
     virtual Display* GetDisplay() override {
         return display_;
+    }
+    
+    virtual Camera* GetCamera() override {
+        return camera_;
     }
 };
 

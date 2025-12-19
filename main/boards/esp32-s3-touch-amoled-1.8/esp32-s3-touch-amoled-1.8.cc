@@ -1,18 +1,16 @@
 #include "wifi_board.h"
 #include "display/lcd_display.h"
 #include "esp_lcd_sh8601.h"
-#include "font_awesome_symbols.h"
 
-#include "audio_codecs/es8311_audio_codec.h"
+#include "codecs/es8311_audio_codec.h"
 #include "application.h"
 #include "button.h"
 #include "led/single_led.h"
-#include "iot/thing_manager.h"
+#include "mcp_server.h"
 #include "config.h"
 #include "power_save_timer.h"
 #include "axp2101.h"
 #include "i2c_device.h"
-#include <wifi_station.h>
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
@@ -21,10 +19,11 @@
 #include "esp_io_expander_tca9554.h"
 #include "settings.h"
 
-#define TAG "waveshare_amoled_1_8"
+#include <esp_lcd_touch_ft5x06.h>
+#include <esp_lvgl_port.h>
+#include <lvgl.h>
 
-LV_FONT_DECLARE(font_puhui_30_4);
-LV_FONT_DECLARE(font_awesome_30_4);
+#define TAG "WaveshareEsp32s3TouchAMOLED1inch8"
 
 class Pmic : public Axp2101 {
 public:
@@ -83,16 +82,7 @@ public:
                     bool mirror_y,
                     bool swap_xy)
         : SpiLcdDisplay(io_handle, panel_handle,
-                    width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy,
-                    {
-                        .text_font = &font_puhui_30_4,
-                        .icon_font = &font_awesome_30_4,
-#if CONFIG_USE_WECHAT_MESSAGE_STYLE
-                        .emoji_font = font_emoji_32_init(),
-#else
-                        .emoji_font = font_emoji_64_init(),
-#endif
-                    }) {
+                    width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
         DisplayLockGuard lock(this);
         lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES * 0.1, 0);
         lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES * 0.1, 0);
@@ -118,7 +108,7 @@ protected:
     }
 };
 
-class waveshare_amoled_1_8 : public WifiBoard {
+class WaveshareEsp32s3TouchAMOLED1inch8 : public WifiBoard {
 private:
     i2c_master_bus_handle_t codec_i2c_bus_;
     Pmic* pmic_ = nullptr;
@@ -131,16 +121,11 @@ private:
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
         power_save_timer_->OnEnterSleepMode([this]() {
-            ESP_LOGI(TAG, "Enabling sleep mode");
-            auto display = GetDisplay();
-            display->SetChatMessage("system", "");
-            display->SetEmotion("sleepy");
+            GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(20);
         });
         power_save_timer_->OnExitSleepMode([this]() {
-            auto display = GetDisplay();
-            display->SetChatMessage("system", "");
-            display->SetEmotion("neutral");
+            GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
         });
         power_save_timer_->OnShutdownRequest([this]() {
@@ -203,8 +188,9 @@ private:
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ResetWifiConfiguration();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                EnterWifiConfigMode();
+                return;
             }
             app.ToggleChatState();
         });
@@ -252,17 +238,52 @@ private:
         backlight_->RestoreBrightness();
     }
 
-    // 物联网初始化，添加对 AI 可见设备
-    void InitializeIot() {
-        auto& thing_manager = iot::ThingManager::GetInstance();
-        thing_manager.AddThing(iot::CreateThing("Speaker"));
-        thing_manager.AddThing(iot::CreateThing("Screen"));
-        thing_manager.AddThing(iot::CreateThing("Battery"));
-        thing_manager.AddThing(iot::CreateThing("BoardControl"));
+    void InitializeTouch()
+    {
+        esp_lcd_touch_handle_t tp;
+        esp_lcd_touch_config_t tp_cfg = {
+            .x_max = DISPLAY_WIDTH,
+            .y_max = DISPLAY_HEIGHT,
+            .rst_gpio_num = GPIO_NUM_NC,
+            .int_gpio_num = GPIO_NUM_21,
+            .levels = {
+                .reset = 0,
+                .interrupt = 0,
+            },
+            .flags = {
+                .swap_xy = 0,
+                .mirror_x = 0,
+                .mirror_y = 0,
+            },
+        };
+        esp_lcd_panel_io_handle_t tp_io_handle = NULL;
+        esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_FT5x06_CONFIG();
+        tp_io_config.scl_speed_hz = 400 * 1000;
+        ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(codec_i2c_bus_, &tp_io_config, &tp_io_handle));
+        ESP_LOGI(TAG, "Initialize touch controller");
+        ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp));
+        const lvgl_port_touch_cfg_t touch_cfg = {
+            .disp = lv_display_get_default(), 
+            .handle = tp,
+        };
+        lvgl_port_add_touch(&touch_cfg);
+        ESP_LOGI(TAG, "Touch panel initialized successfully");
+    }
+
+    // 初始化工具
+    void InitializeTools() {
+        auto &mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.system.reconfigure_wifi",
+            "End this conversation and enter WiFi configuration mode.\n"
+            "**CAUTION** You must ask the user to confirm this action.",
+            PropertyList(), [this](const PropertyList& properties) {
+                EnterWifiConfigMode();
+                return true;
+            });
     }
 
 public:
-    waveshare_amoled_1_8() :
+    WaveshareEsp32s3TouchAMOLED1inch8() :
         boot_button_(BOOT_BUTTON_GPIO) {
         InitializePowerSaveTimer();
         InitializeCodecI2c();
@@ -270,8 +291,9 @@ public:
         InitializeAxp2101();
         InitializeSpi();
         InitializeSH8601Display();
+        InitializeTouch();
         InitializeButtons();
-        InitializeIot();
+        InitializeTools();
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -302,12 +324,12 @@ public:
         return true;
     }
 
-    virtual void SetPowerSaveMode(bool enabled) override {
-        if (!enabled) {
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        if (level != PowerSaveLevel::LOW_POWER) {
             power_save_timer_->WakeUp();
         }
-        WifiBoard::SetPowerSaveMode(enabled);
+        WifiBoard::SetPowerSaveLevel(level);
     }
 };
 
-DECLARE_BOARD(waveshare_amoled_1_8);
+DECLARE_BOARD(WaveshareEsp32s3TouchAMOLED1inch8);

@@ -1,33 +1,30 @@
 #include "wifi_board.h"
-#include "audio_codecs/es8311_audio_codec.h"
+#include "codecs/es8311_audio_codec.h"
 #include "display/lcd_display.h"
 #include "system_reset.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
-#include "iot/thing_manager.h"
 #include "led/single_led.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
-#include <wifi_station.h>
+#include "esp32_camera.h"
 
 #define TAG "kevin-sp-v4"
 
-LV_FONT_DECLARE(font_puhui_20_4);
-LV_FONT_DECLARE(font_awesome_20_4);
-
 class KEVIN_SP_V4Board : public WifiBoard {
 private:
-    i2c_master_bus_handle_t display_i2c_bus_;
     Button boot_button_;
     LcdDisplay* display_;
-    i2c_master_bus_handle_t codec_i2c_bus_;
+    i2c_master_bus_handle_t i2c_bus_;
+    Esp32Camera* camera_;
+
     void InitializeCodecI2c() {
         // Initialize I2C peripheral
         i2c_master_bus_config_t i2c_bus_cfg = {
-            .i2c_port = I2C_NUM_0,
+            .i2c_port = I2C_NUM_1,
             .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
             .scl_io_num = AUDIO_CODEC_I2C_SCL_PIN,
             .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -38,7 +35,7 @@ private:
                 .enable_internal_pullup = 1,
             },
         };
-        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &codec_i2c_bus_));
+        ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
 
     void InitializeSpi() {
@@ -55,8 +52,9 @@ private:
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ResetWifiConfiguration();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                EnterWifiConfigMode();
+                return;
             }
         });
         boot_button_.OnPressDown([this]() {
@@ -96,20 +94,47 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, true));
 
         display_ = new SpiLcdDisplay(panel_io, panel,
-                            DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
-                            {
-                                .text_font = &font_puhui_20_4,
-                                .icon_font = &font_awesome_20_4,
-                                .emoji_font = font_emoji_64_init(),
-                            });
+                            DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
-    // 物联网初始化，添加对 AI 可见设备
-    void InitializeIot() {
-        auto& thing_manager = iot::ThingManager::GetInstance();
-        thing_manager.AddThing(iot::CreateThing("Speaker"));
-        thing_manager.AddThing(iot::CreateThing("Screen"));
-        thing_manager.AddThing(iot::CreateThing("Lamp"));
+    void InitializeCamera() {
+        static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
+            .data_width = CAM_CTLR_DATA_WIDTH_8,
+            .data_io = {
+                [0] = CAMERA_PIN_D0,
+                [1] = CAMERA_PIN_D1,
+                [2] = CAMERA_PIN_D2,
+                [3] = CAMERA_PIN_D3,
+                [4] = CAMERA_PIN_D4,
+                [5] = CAMERA_PIN_D5,
+                [6] = CAMERA_PIN_D6,
+                [7] = CAMERA_PIN_D7,
+            },
+            .vsync_io = CAMERA_PIN_VSYNC,
+            .de_io = CAMERA_PIN_HREF,
+            .pclk_io = CAMERA_PIN_PCLK,
+            .xclk_io = CAMERA_PIN_XCLK,
+        };
+
+        esp_video_init_sccb_config_t sccb_config = {
+            .init_sccb = false,
+            .i2c_handle = i2c_bus_,
+            .freq = 100000,
+        };
+
+        esp_video_init_dvp_config_t dvp_config = {
+            .sccb_config = sccb_config,
+            .reset_pin = CAMERA_PIN_RESET,
+            .pwdn_pin = CAMERA_PIN_PWDN,
+            .dvp_pin = dvp_pin_config,
+            .xclk_freq = XCLK_FREQ_HZ,
+        };
+
+        esp_video_init_config_t video_config = {
+            .dvp = &dvp_config,
+        };
+
+        camera_ = new Esp32Camera(video_config);
     }
 
 public:
@@ -119,10 +144,9 @@ public:
         InitializeSpi();
         InitializeButtons();
         InitializeSt7789Display();  
-        InitializeIot();
+        InitializeCamera();
         GetBacklight()->RestoreBrightness();
     }
-    
 
     virtual Led* GetLed() override {
         static SingleLed led(BUILTIN_LED_GPIO);
@@ -130,7 +154,7 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static Es8311AudioCodec audio_codec(codec_i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+        static Es8311AudioCodec audio_codec(i2c_bus_, I2C_NUM_0, AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_GPIO_MCLK, AUDIO_I2S_GPIO_BCLK, AUDIO_I2S_GPIO_WS, AUDIO_I2S_GPIO_DOUT, AUDIO_I2S_GPIO_DIN,
             AUDIO_CODEC_PA_PIN, AUDIO_CODEC_ES8311_ADDR);
         return &audio_codec;
@@ -143,6 +167,10 @@ public:
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
+    }
+    
+    virtual Camera* GetCamera() override {
+        return camera_;
     }
 };
 

@@ -6,17 +6,16 @@
 #include "config.h"
 #include "power_save_timer.h"
 #include "i2c_device.h"
-#include "iot/thing_manager.h"
+#include "sy6970.h"
+#include "pin_config.h"
+#include "esp32_camera.h"
+#include "ir_filter_controller.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
-#include <wifi_station.h>
 
 #define TAG "LilygoTCameraPlusS3Board"
-
-LV_FONT_DECLARE(font_puhui_16_4);
-LV_FONT_DECLARE(font_awesome_16_4);
 
 class Cst816x : public I2cDevice {
 public:
@@ -52,28 +51,42 @@ private:
     TouchPoint_t tp_;
 };
 
+class Pmic : public Sy6970 {
+public:
+
+    Pmic(i2c_master_bus_handle_t i2c_bus, uint8_t addr) : Sy6970(i2c_bus, addr) {
+        uint8_t chip_id = ReadReg(0x14);
+        ESP_LOGI(TAG, "Get sy6970 chip ID: 0x%02X", (chip_id & 0B00111000));
+
+        WriteReg(0x00, 0B00001000); // Disable ILIM pin
+        WriteReg(0x02, 0B11011101); // Enable ADC measurement function
+        WriteReg(0x07, 0B10001101); // Disable watchdog timer feeding function
+    }
+};
+
 class LilygoTCameraPlusS3Board : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     Cst816x *cst816d_;
+    Pmic* pmic_;
     LcdDisplay *display_;
+    Button boot_button_;
     Button key1_button_;
     PowerSaveTimer* power_save_timer_;
+    Esp32Camera* camera_;
 
     void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
+        power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
-            ESP_LOGI(TAG, "Enabling sleep mode");
-            auto display = GetDisplay();
-            display->SetChatMessage("system", "");
-            display->SetEmotion("sleepy");
+            GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(10);
         });
         power_save_timer_->OnExitSleepMode([this]() {
-            auto display = GetDisplay();
-            display->SetChatMessage("system", "");
-            display->SetEmotion("neutral");
+            GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
+        });
+        power_save_timer_->OnShutdownRequest([this]() {
+            pmic_->PowerOff();
         });
         power_save_timer_->SetEnabled(true);
     }
@@ -116,7 +129,7 @@ private:
         }
     }
 
-    static void touchpad_daemon(void *param) {
+    static void TouchpadDaemon(void *param) {
         vTaskDelay(pdMS_TO_TICKS(2000));
         auto &board = (LilygoTCameraPlusS3Board&)Board::GetInstance();
         auto touchpad = board.GetTouchpad();
@@ -141,8 +154,8 @@ private:
 
     void InitCst816d() {
         ESP_LOGI(TAG, "Init CST816x");
-        cst816d_ = new Cst816x(i2c_bus_, 0x15);
-        xTaskCreate(touchpad_daemon, "tp", 2048, NULL, 5, NULL);
+        cst816d_ = new Cst816x(i2c_bus_, CST816_ADDRESS);
+        xTaskCreate(TouchpadDaemon, "tp", 2048, NULL, 5, NULL);
     }
 
     void InitSpi() {
@@ -154,6 +167,11 @@ private:
         buscfg.quadhd_io_num = GPIO_NUM_NC;
         buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
         ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    }
+
+    void InitSy6970() {
+        ESP_LOGI(TAG, "Init Sy6970");
+        pmic_ = new Pmic(i2c_bus_, SY6970_ADDRESS);
     }
 
     void InitializeSt7789Display() {
@@ -185,42 +203,94 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, true));
 
         display_ = new SpiLcdDisplay(panel_io, panel,
-                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
-                                     {
-                                         .text_font = &font_puhui_16_4,
-                                         .icon_font = &font_awesome_16_4,
-                                         .emoji_font = font_emoji_32_init(),
-                                     });
+                                     DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
     void InitializeButtons() {
-        key1_button_.OnClick([this]() {
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ResetWifiConfiguration();
-            }
+        boot_button_.OnClick([this]() {
             power_save_timer_->WakeUp();
+            auto& app = Application::GetInstance();
+            // During startup (before connected), pressing BOOT button enters Wi-Fi config mode without reboot
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                EnterWifiConfigMode();
+                return;
+            }
             app.ToggleChatState();
+        });
+        key1_button_.OnClick([this]() {
+            if (camera_) {
+                camera_->Capture();
+            }
         });
     }
 
-    // 物联网初始化，添加对 AI 可见设备
-    void InitializeIot() {
-        auto &thing_manager = iot::ThingManager::GetInstance();
-        thing_manager.AddThing(iot::CreateThing("Speaker"));
-        thing_manager.AddThing(iot::CreateThing("Screen"));
+    void InitializeCamera() {
+        static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
+            .data_width = CAM_CTLR_DATA_WIDTH_8,
+            .data_io = {
+                [0] = Y2_GPIO_NUM,
+                [1] = Y3_GPIO_NUM,
+                [2] = Y4_GPIO_NUM,
+                [3] = Y5_GPIO_NUM,
+                [4] = Y6_GPIO_NUM,
+                [5] = Y7_GPIO_NUM,
+                [6] = Y8_GPIO_NUM,
+                [7] = Y9_GPIO_NUM,
+            },
+            .vsync_io = VSYNC_GPIO_NUM,
+            .de_io = HREF_GPIO_NUM,
+            .pclk_io = PCLK_GPIO_NUM,
+            .xclk_io = XCLK_GPIO_NUM,
+        };
+
+        esp_video_init_sccb_config_t sccb_config = {
+#ifdef CONFIG_BOARD_TYPE_LILYGO_T_CAMERAPLUS_S3_V1_0_V1_1
+            .init_sccb = false,
+            .i2c_handle = i2c_bus_,
+#elif defined CONFIG_BOARD_TYPE_LILYGO_T_CAMERAPLUS_S3_V1_2
+            .init_sccb = true,
+            .i2c_config = {
+                .port = 1,
+                .scl_pin = SIOC_GPIO_NUM,
+                .sda_pin = SIOD_GPIO_NUM,
+            },
+#endif
+            .freq = 100000,
+        };
+
+        esp_video_init_dvp_config_t dvp_config = {
+            .sccb_config = sccb_config,
+            .reset_pin = RESET_GPIO_NUM,
+            .pwdn_pin = PWDN_GPIO_NUM,
+            .dvp_pin = dvp_pin_config,
+            .xclk_freq = XCLK_FREQ_HZ,
+        };
+
+        esp_video_init_config_t video_config = {
+            .dvp = &dvp_config,
+        };
+
+        camera_ = new Esp32Camera(video_config);
+        camera_->SetVFlip(1);
+        camera_->SetHMirror(1);
+    }
+
+    void InitializeTools() {
+        static IrFilterController irFilter(AP1511B_GPIO);
     }
 
 public:
-    LilygoTCameraPlusS3Board() : key1_button_(KEY1_BUTTON_GPIO) {
+    LilygoTCameraPlusS3Board() : boot_button_(BOOT_BUTTON_GPIO), key1_button_(KEY1_BUTTON_GPIO) {
         InitializePowerSaveTimer();
         InitI2c();
+        InitSy6970();
         InitCst816d();
         I2cDetect();
         InitSpi();
         InitializeSt7789Display();
         InitializeButtons();
-        InitializeIot();
+        InitializeCamera();
+        InitializeTools();
         GetBacklight()->RestoreBrightness();
     }
 
@@ -242,11 +312,25 @@ public:
         return display_;
     }
 
-    virtual void SetPowerSaveMode(bool enabled) override {
-        if (!enabled) {
+    virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging) override {
+        static bool last_discharging = false;
+        charging = pmic_->IsCharging();
+        bool is_power_good = pmic_->IsPowerGood();
+        discharging = !charging && is_power_good;
+        if (discharging != last_discharging) {
+            power_save_timer_->SetEnabled(discharging);
+            last_discharging = discharging;
+        }
+
+        level = pmic_->GetBatteryLevel();
+        return true;
+    }
+
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        if (level != PowerSaveLevel::LOW_POWER) {
             power_save_timer_->WakeUp();
         }
-        WifiBoard::SetPowerSaveMode(enabled);
+        WifiBoard::SetPowerSaveLevel(level);
     }
     
     virtual Backlight* GetBacklight() override {
@@ -256,6 +340,10 @@ public:
 
     Cst816x *GetTouchpad() {
         return cst816d_;
+    }
+
+    virtual Camera* GetCamera() override {
+        return camera_;
     }
 };
 

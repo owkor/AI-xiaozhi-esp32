@@ -2,11 +2,12 @@
 #include "k10_audio_codec.h"
 #include "display/lcd_display.h"
 #include "esp_lcd_ili9341.h"
-#include "font_awesome_symbols.h"
+#include "led_control.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
-#include "iot/thing_manager.h"
+#include "esp32_camera.h"
+
 #include "led/circular_strip.h"
 #include "assets/lang_config.h"
 
@@ -14,14 +15,10 @@
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
-#include <wifi_station.h>
 
 #include "esp_io_expander_tca95xx_16bit.h"
 
 #define TAG "DF-K10"
-
-LV_FONT_DECLARE(font_puhui_20_4);
-LV_FONT_DECLARE(font_awesome_20_4);
 
 class Df_K10Board : public WifiBoard {
 private:
@@ -30,6 +27,14 @@ private:
     LcdDisplay *display_;
     button_handle_t btn_a;
     button_handle_t btn_b;
+    Esp32Camera* camera_;
+
+    button_driver_t* btn_a_driver_ = nullptr;
+    button_driver_t* btn_b_driver_ = nullptr;
+
+    CircularStrip* led_strip_;
+
+    static Df_K10Board* instance_;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -95,33 +100,31 @@ private:
             ESP_LOGE(TAG, "Set direction failed: %s", esp_err_to_name(ret));
         }
     }
+
     void InitializeButtons() {
+        instance_ = this;
+
         // Button A
         button_config_t btn_a_config = {
-            .type = BUTTON_TYPE_CUSTOM,
             .long_press_time = 1000,
-            .short_press_time = 50,
-            .custom_button_config = {
-                .active_level = 0,
-                .button_custom_init =nullptr,
-                .button_custom_get_key_value = [](void *param) -> uint8_t {
-                    auto self = static_cast<Df_K10Board*>(param);
-                    return self->IoExpanderGetLevel(IO_EXPANDER_PIN_NUM_2);
-                },
-                .button_custom_deinit = nullptr,
-                .priv = this,
-            },
+            .short_press_time = 0
         };
-        btn_a = iot_button_create(&btn_a_config);
-        iot_button_register_cb(btn_a, BUTTON_SINGLE_CLICK, [](void* button_handle, void* usr_data) {
+        btn_a_driver_ = (button_driver_t*)calloc(1, sizeof(button_driver_t));
+        btn_a_driver_->enable_power_save = false;
+        btn_a_driver_->get_key_level = [](button_driver_t *button_driver) -> uint8_t {
+            return !instance_->IoExpanderGetLevel(IO_EXPANDER_PIN_NUM_2);
+        };
+        ESP_ERROR_CHECK(iot_button_create(&btn_a_config, btn_a_driver_, &btn_a));
+        iot_button_register_cb(btn_a, BUTTON_SINGLE_CLICK, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<Df_K10Board*>(usr_data);
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                self->ResetWifiConfiguration();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                self->EnterWifiConfigMode();
+                return;
             }
             app.ToggleChatState();
         }, this);
-        iot_button_register_cb(btn_a, BUTTON_LONG_PRESS_START, [](void* button_handle, void* usr_data) {
+        iot_button_register_cb(btn_a, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<Df_K10Board*>(usr_data);
             auto codec = self->GetAudioCodec();
             auto volume = codec->output_volume() - 10;
@@ -134,30 +137,25 @@ private:
 
         // Button B
         button_config_t btn_b_config = {
-            .type = BUTTON_TYPE_CUSTOM,
             .long_press_time = 1000,
-            .short_press_time = 50,
-            .custom_button_config = {
-                .active_level = 0,
-                .button_custom_init =nullptr,
-                .button_custom_get_key_value = [](void *param) -> uint8_t {
-                    auto self = static_cast<Df_K10Board*>(param);
-                    return self->IoExpanderGetLevel(IO_EXPANDER_PIN_NUM_12);
-                },
-                .button_custom_deinit = nullptr,
-                .priv = this,
-            },
+            .short_press_time = 0
         };
-        btn_b = iot_button_create(&btn_b_config);
-        iot_button_register_cb(btn_b, BUTTON_SINGLE_CLICK, [](void* button_handle, void* usr_data) {
+        btn_b_driver_ = (button_driver_t*)calloc(1, sizeof(button_driver_t));
+        btn_b_driver_->enable_power_save = false;
+        btn_b_driver_->get_key_level = [](button_driver_t *button_driver) -> uint8_t {
+            return !instance_->IoExpanderGetLevel(IO_EXPANDER_PIN_NUM_12);
+        };
+        ESP_ERROR_CHECK(iot_button_create(&btn_b_config, btn_b_driver_, &btn_b));
+        iot_button_register_cb(btn_b, BUTTON_SINGLE_CLICK, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<Df_K10Board*>(usr_data);
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                self->ResetWifiConfiguration();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                self->EnterWifiConfigMode();
+                return;
             }
             app.ToggleChatState();
         }, this);
-        iot_button_register_cb(btn_b, BUTTON_LONG_PRESS_START, [](void* button_handle, void* usr_data) {
+        iot_button_register_cb(btn_b, BUTTON_LONG_PRESS_START, nullptr, [](void* button_handle, void* usr_data) {
             auto self = static_cast<Df_K10Board*>(usr_data);
             auto codec = self->GetAudioCodec();
             auto volume = codec->output_volume() + 10;
@@ -167,6 +165,46 @@ private:
             codec->SetOutputVolume(volume);
             self->GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
         }, this);
+    }
+
+    void InitializeCamera() {
+        static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
+            .data_width = CAM_CTLR_DATA_WIDTH_8,
+            .data_io = {
+                [0] = CAMERA_PIN_D2,
+                [1] = CAMERA_PIN_D3,
+                [2] = CAMERA_PIN_D4,
+                [3] = CAMERA_PIN_D5,
+                [4] = CAMERA_PIN_D6,
+                [5] = CAMERA_PIN_D7,
+                [6] = CAMERA_PIN_D8,
+                [7] = CAMERA_PIN_D9,
+            },
+            .vsync_io = CAMERA_PIN_VSYNC,
+            .de_io = CAMERA_PIN_HREF,
+            .pclk_io = CAMERA_PIN_PCLK,
+            .xclk_io = CAMERA_PIN_XCLK,
+        };
+
+        esp_video_init_sccb_config_t sccb_config = {
+            .init_sccb = false,
+            .i2c_handle = i2c_bus_,
+            .freq = 100000,
+        };
+
+        esp_video_init_dvp_config_t dvp_config = {
+            .sccb_config = sccb_config,
+            .reset_pin = CAMERA_PIN_RESET,
+            .pwdn_pin = CAMERA_PIN_PWDN,
+            .dvp_pin = dvp_pin_config,
+            .xclk_freq = XCLK_FREQ_HZ,
+        };
+
+        esp_video_init_config_t video_config = {
+            .dvp = &dvp_config,
+        };
+
+        camera_ = new Esp32Camera(video_config);
     }
 
     void InitializeIli9341Display() {
@@ -201,18 +239,13 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
         display_ = new SpiLcdDisplay(panel_io, panel,
-                                DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
-                                {
-                                        .text_font = &font_puhui_20_4,
-                                        .icon_font = &font_awesome_20_4,
-                                        .emoji_font = font_emoji_64_init(),
-                                });
+                                DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
     // 物联网初始化，添加对 AI 可见设备
     void InitializeIot() {
-        auto &thing_manager = iot::ThingManager::GetInstance();
-        thing_manager.AddThing(iot::CreateThing("Speaker"));
+        led_strip_ = new CircularStrip(BUILTIN_LED_GPIO, 3);
+        new LedStripControl(led_strip_);
     }
 
 public:
@@ -223,11 +256,11 @@ public:
         InitializeIli9341Display();
         InitializeButtons();
         InitializeIot();
+        InitializeCamera();
     }
 
     virtual Led* GetLed() override {
-        static CircularStrip led(BUILTIN_LED_GPIO, 3);
-        return &led;
+        return led_strip_;
     }
 
     virtual AudioCodec *GetAudioCodec() override {
@@ -247,9 +280,15 @@ public:
         return &audio_codec;
     }
 
+    virtual Camera* GetCamera() override {
+        return camera_;
+    }
+
     virtual Display *GetDisplay() override {
         return display_;
     }
 };
 
 DECLARE_BOARD(Df_K10Board);
+
+Df_K10Board* Df_K10Board::instance_ = nullptr;

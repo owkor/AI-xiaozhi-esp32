@@ -1,17 +1,16 @@
 #include "wifi_board.h"
-#include "audio_codecs/es8311_audio_codec.h"
+#include "codecs/es8311_audio_codec.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
 #include "i2c_device.h"
-#include "iot/thing_manager.h"
 #include "assets/lang_config.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
-#include <wifi_station.h>
+#include "esp32_camera.h"
 
-#define TAG "AtomS3R M12+EchoBase"
+#define TAG "AtomS3R CAM/M12 + EchoBase"
 
 #define PI4IOE_ADDR          0x43
 #define PI4IOE_REG_CTRL      0x00
@@ -39,6 +38,7 @@ private:
     i2c_master_bus_handle_t i2c_bus_;
     Pi4ioe* pi4ioe_ = nullptr;
     bool is_echo_base_connected_ = false;
+    Esp32Camera* camera_;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -122,23 +122,65 @@ private:
 
         ESP_LOGI(TAG, "Camera Power Enabled");
 
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    // 物联网初始化，添加对 AI 可见设备
-    void InitializeIot() {
-        auto& thing_manager = iot::ThingManager::GetInstance();
-        thing_manager.AddThing(iot::CreateThing("Speaker"));
+    void InitializeCamera() {
+        static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
+            .data_width = CAM_CTLR_DATA_WIDTH_8,
+            .data_io = {
+                [0] = CAMERA_PIN_D0,
+                [1] = CAMERA_PIN_D1,
+                [2] = CAMERA_PIN_D2,
+                [3] = CAMERA_PIN_D3,
+                [4] = CAMERA_PIN_D4,
+                [5] = CAMERA_PIN_D5,
+                [6] = CAMERA_PIN_D6,
+                [7] = CAMERA_PIN_D7,
+            },
+            .vsync_io = CAMERA_PIN_VSYNC,
+            .de_io = CAMERA_PIN_HREF,
+            .pclk_io = CAMERA_PIN_PCLK,
+            .xclk_io = CAMERA_PIN_XCLK,
+        };
+
+        esp_video_init_sccb_config_t sccb_config = {
+            .init_sccb = true,
+            .i2c_config = {
+                .port = 1,
+                .scl_pin = CAMERA_PIN_SIOC,
+                .sda_pin = CAMERA_PIN_SIOD,
+            },
+            .freq = 100000,
+        };
+
+        esp_video_init_dvp_config_t dvp_config = {
+            .sccb_config = sccb_config,
+            .reset_pin = CAMERA_PIN_RESET,
+            .pwdn_pin = CAMERA_PIN_PWDN,
+            .dvp_pin = dvp_pin_config,
+            .xclk_freq = XCLK_FREQ_HZ,
+        };
+
+        esp_video_init_config_t video_config = {
+            .dvp = &dvp_config,
+        };
+
+        camera_ = new Esp32Camera(video_config);
+        camera_->SetHMirror(false);
     }
 
+    virtual Camera* GetCamera() override {
+        return camera_;
+    }
 public:
     AtomS3rCamM12EchoBaseBoard() {
         EnableCameraPower(); // IO18 还会控制指示灯
+        InitializeCamera();
         InitializeI2c();
         I2cDetect();
         CheckEchoBaseConnection();
         InitializePi4ioe();
-        InitializeIot();
     }
 
     virtual AudioCodec* GetAudioCodec() override {

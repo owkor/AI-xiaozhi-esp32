@@ -1,25 +1,20 @@
 #include "wifi_board.h"
 #include "ml307_board.h"
 
-#include "audio_codecs/no_audio_codec.h"
+#include "codecs/no_audio_codec.h"
 #include "display/lcd_display.h"
 #include "system_reset.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
-#include "iot/thing_manager.h"
 #include "led/single_led.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
-#include <wifi_station.h>
+#include "esp32_camera.h"
 
 #define TAG "kevin-sp-v3"
-
-LV_FONT_DECLARE(font_puhui_20_4);
-LV_FONT_DECLARE(font_awesome_20_4);
-
 
 // class KEVIN_SP_V3Board : public Ml307Board {
 class KEVIN_SP_V3Board : public WifiBoard {
@@ -27,6 +22,7 @@ private:
     i2c_master_bus_handle_t display_i2c_bus_;
     Button boot_button_;
     LcdDisplay* display_;
+    Esp32Camera* camera_;
 
     void InitializeSpi() {
         spi_bus_config_t buscfg = {};
@@ -42,8 +38,9 @@ private:
     void InitializeButtons() {
         boot_button_.OnClick([this]() {
             auto& app = Application::GetInstance();
-            if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
-                ResetWifiConfiguration();
+            if (app.GetDeviceState() == kDeviceStateStarting) {
+                EnterWifiConfigMode();
+                return;
             }
         });
         boot_button_.OnPressDown([this]() {
@@ -83,35 +80,62 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel, true));
 
         display_ = new SpiLcdDisplay(panel_io, panel,
-                            DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
-                            {
-                                .text_font = &font_puhui_20_4,
-                                .icon_font = &font_awesome_20_4,
-                                .emoji_font = font_emoji_64_init(),
-                            });
+                            DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
-    // 物联网初始化，添加对 AI 可见设备
-    void InitializeIot() {
-        auto& thing_manager = iot::ThingManager::GetInstance();
-        thing_manager.AddThing(iot::CreateThing("Speaker"));
-        thing_manager.AddThing(iot::CreateThing("Screen"));
-        thing_manager.AddThing(iot::CreateThing("Lamp"));
+    void InitializeCamera() {
+        static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
+            .data_width = CAM_CTLR_DATA_WIDTH_8,
+            .data_io = {
+                [0] = CAMERA_PIN_D0,
+                [1] = CAMERA_PIN_D1,
+                [2] = CAMERA_PIN_D2,
+                [3] = CAMERA_PIN_D3,
+                [4] = CAMERA_PIN_D4,
+                [5] = CAMERA_PIN_D5,
+                [6] = CAMERA_PIN_D6,
+                [7] = CAMERA_PIN_D7,
+            },
+            .vsync_io = CAMERA_PIN_VSYNC,
+            .de_io = CAMERA_PIN_HREF,
+            .pclk_io = CAMERA_PIN_PCLK,
+            .xclk_io = CAMERA_PIN_XCLK,
+        };
+
+        esp_video_init_sccb_config_t sccb_config = {
+            .init_sccb = true,
+            .i2c_config = {
+                .port = 1,
+                .scl_pin = CAMERA_PIN_SIOC,
+                .sda_pin = CAMERA_PIN_SIOD,
+            },
+            .freq = 100000,
+        };
+
+        esp_video_init_dvp_config_t dvp_config = {
+            .sccb_config = sccb_config,
+            .reset_pin = CAMERA_PIN_RESET,
+            .pwdn_pin = CAMERA_PIN_PWDN,
+            .dvp_pin = dvp_pin_config,
+            .xclk_freq = XCLK_FREQ_HZ,
+        };
+
+        esp_video_init_config_t video_config = {
+            .dvp = &dvp_config,
+        };
+
+        camera_ = new Esp32Camera(video_config);
     }
 
 public:
-    KEVIN_SP_V3Board() : 
-    // Ml307Board(ML307_TX_PIN, ML307_RX_PIN, 4096),
-    boot_button_(BOOT_BUTTON_GPIO) {
+    KEVIN_SP_V3Board() :  boot_button_(BOOT_BUTTON_GPIO) {
         ESP_LOGI(TAG, "Initializing KEVIN_SP_V3 Board");
-
         InitializeSpi();
         InitializeButtons();
         InitializeSt7789Display();  
-        InitializeIot();
+        InitializeCamera();
         GetBacklight()->RestoreBrightness();
     }
-    
 
     virtual Led* GetLed() override {
         static SingleLed led(BUILTIN_LED_GPIO);
@@ -131,6 +155,10 @@ public:
     virtual Backlight* GetBacklight() override {
         static PwmBacklight backlight(DISPLAY_BACKLIGHT_PIN, DISPLAY_BACKLIGHT_OUTPUT_INVERT);
         return &backlight;
+    }
+    
+    virtual Camera* GetCamera() override {
+        return camera_;
     }
 };
 

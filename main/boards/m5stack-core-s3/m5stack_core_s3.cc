@@ -5,21 +5,17 @@
 #include "config.h"
 #include "power_save_timer.h"
 #include "i2c_device.h"
-#include "iot/thing_manager.h"
 #include "axp2101.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
-#include <wifi_station.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_ili9341.h>
 #include <esp_timer.h>
+#include "esp32_camera.h"
 
 #define TAG "M5StackCoreS3Board"
-
-LV_FONT_DECLARE(font_puhui_20_4);
-LV_FONT_DECLARE(font_awesome_20_4);
 
 class Pmic : public Axp2101 {
 public:
@@ -43,7 +39,6 @@ public:
     }
 };
 
-
 class CustomBacklight : public Backlight {
 public:
     CustomBacklight(Pmic *pmic) : pmic_(pmic) {}
@@ -56,7 +51,6 @@ public:
 private:
     Pmic *pmic_;
 };
-
 
 class Aw9523 : public I2cDevice {
 public:
@@ -122,7 +116,6 @@ private:
     TouchPoint_t tp_;
 };
 
-
 class M5StackCoreS3Board : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
@@ -130,22 +123,18 @@ private:
     Aw9523* aw9523_;
     Ft6336* ft6336_;
     LcdDisplay* display_;
+    Esp32Camera* camera_;
     esp_timer_handle_t touchpad_timer_;
     PowerSaveTimer* power_save_timer_;
 
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
         power_save_timer_->OnEnterSleepMode([this]() {
-            ESP_LOGI(TAG, "Enabling sleep mode");
-            auto display = GetDisplay();
-            display->SetChatMessage("system", "");
-            display->SetEmotion("sleepy");
+            GetDisplay()->SetPowerSaveMode(true);
             GetBacklight()->SetBrightness(10);
         });
         power_save_timer_->OnExitSleepMode([this]() {
-            auto display = GetDisplay();
-            display->SetChatMessage("system", "");
-            display->SetEmotion("neutral");
+            GetDisplay()->SetPowerSaveMode(false);
             GetBacklight()->RestoreBrightness();
         });
         power_save_timer_->OnShutdownRequest([this]() {
@@ -224,9 +213,9 @@ private:
             // 只有短触才触发
             if (touch_duration < TOUCH_THRESHOLD_MS) {
                 auto& app = Application::GetInstance();
-                if (app.GetDeviceState() == kDeviceStateStarting && 
-                    !WifiStation::GetInstance().IsConnected()) {
-                    ResetWifiConfiguration();
+                if (app.GetDeviceState() == kDeviceStateStarting) {
+                    EnterWifiConfigMode();
+                    return;
                 }
                 app.ToggleChatState();
             }
@@ -297,24 +286,48 @@ private:
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
 
         display_ = new SpiLcdDisplay(panel_io, panel,
-                                    DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY,
-                                    {
-                                        .text_font = &font_puhui_20_4,
-                                        .icon_font = &font_awesome_20_4,
-#if CONFIG_USE_WECHAT_MESSAGE_STYLE
-                                        .emoji_font = font_emoji_32_init(),
-#else
-                                        .emoji_font = font_emoji_64_init(),
-#endif
-                                    });
+                                    DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
     }
 
-    // 物联网初始化，添加对 AI 可见设备
-    void InitializeIot() {
-        auto& thing_manager = iot::ThingManager::GetInstance();
-        thing_manager.AddThing(iot::CreateThing("Speaker"));
-        thing_manager.AddThing(iot::CreateThing("Screen"));
-        thing_manager.AddThing(iot::CreateThing("Battery"));
+     void InitializeCamera() {
+        static esp_cam_ctlr_dvp_pin_config_t dvp_pin_config = {
+            .data_width = CAM_CTLR_DATA_WIDTH_8,
+            .data_io = {
+                [0] = CAMERA_PIN_D0,
+                [1] = CAMERA_PIN_D1,
+                [2] = CAMERA_PIN_D2,
+                [3] = CAMERA_PIN_D3,
+                [4] = CAMERA_PIN_D4,
+                [5] = CAMERA_PIN_D5,
+                [6] = CAMERA_PIN_D6,
+                [7] = CAMERA_PIN_D7,
+            },
+            .vsync_io = CAMERA_PIN_VSYNC,
+            .de_io = CAMERA_PIN_HREF,
+            .pclk_io = CAMERA_PIN_PCLK,
+            .xclk_io = CAMERA_PIN_XCLK,
+        };
+
+        esp_video_init_sccb_config_t sccb_config = {
+            .init_sccb = false,
+            .i2c_handle = i2c_bus_,
+            .freq = 100000,
+        };
+
+        esp_video_init_dvp_config_t dvp_config = {
+            .sccb_config = sccb_config,
+            .reset_pin = CAMERA_PIN_RESET,
+            .pwdn_pin = CAMERA_PIN_PWDN,
+            .dvp_pin = dvp_pin_config,
+            .xclk_freq = XCLK_FREQ_HZ,
+        };
+
+        esp_video_init_config_t video_config = {
+            .dvp = &dvp_config,
+        };
+
+        camera_ = new Esp32Camera(video_config);
+        camera_->SetHMirror(false);
     }
 
 public:
@@ -326,7 +339,7 @@ public:
         I2cDetect();
         InitializeSpi();
         InitializeIli9342Display();
-        InitializeIot();
+        InitializeCamera();
         InitializeFt6336TouchPad();
         GetBacklight()->RestoreBrightness();
     }
@@ -350,6 +363,10 @@ public:
         return display_;
     }
 
+    virtual Camera* GetCamera() override {
+        return camera_;
+    }
+
     virtual bool GetBatteryLevel(int &level, bool& charging, bool& discharging) override {
         static bool last_discharging = false;
         charging = pmic_->IsCharging();
@@ -363,11 +380,11 @@ public:
         return true;
     }
 
-    virtual void SetPowerSaveMode(bool enabled) override {
-        if (!enabled) {
+    virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
+        if (level != PowerSaveLevel::LOW_POWER) {
             power_save_timer_->WakeUp();
         }
-        WifiBoard::SetPowerSaveMode(enabled);
+        WifiBoard::SetPowerSaveLevel(level);
     }
 
     virtual Backlight *GetBacklight() override {
